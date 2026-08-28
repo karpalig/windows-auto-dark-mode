@@ -33,14 +33,14 @@ if (-not $isAdmin) {
 # Папка, где лежит сам install.ps1 - работает независимо от пользователя и диска
 $root = $PSScriptRoot
 
-if (-not (Test-Path "$root\run_dark.vbs") -or -not (Test-Path "$root\run_light.vbs")) {
-    Write-Host "Ошибка: run_dark.vbs / run_light.vbs не найдены рядом с install.ps1." -ForegroundColor Red
+if (-not (Test-Path "$root\run_theme.vbs")) {
+    Write-Host "Ошибка: run_theme.vbs не найден рядом с install.ps1." -ForegroundColor Red
     Write-Host "Убедитесь, что запускаете install.ps1 из папки проекта со всеми файлами." -ForegroundColor Red
     exit 1
 }
 
-$actionDark  = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$root\run_dark.vbs`""
-$actionLight = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$root\run_light.vbs`""
+$actionDark  = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$root\run_theme.vbs`" dark"
+$actionLight = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$root\run_theme.vbs`" light"
 
 $triggerDark  = New-ScheduledTaskTrigger -Daily -At $DarkTime
 $triggerLight = New-ScheduledTaskTrigger -Daily -At $LightTime
