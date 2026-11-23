@@ -1,6 +1,6 @@
 ﻿# install.ps1
 # Устанавливает автопереключение темы Windows через Планировщик заданий.
-# Запускать из PowerShell от имени администратора, находясь в папке проекта:
+# Права администратора не нужны. Запускать из папки проекта:
 #   .\install.ps1
 #
 # Можно задать своё время:
@@ -11,58 +11,91 @@ param(
     [string]$LightTime = "08:00"
 )
 
-# Регистрация задач в Планировщике требует прав администратора.
-# Если их нет - перезапускаем этот же скрипт с повышением прав (UAC)
-# и завершаем текущий (неповышенный) процесс.
-$currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
-$isAdmin = ([Security.Principal.WindowsPrincipal]$currentIdentity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+$ErrorActionPreference = "Stop"
+$taskName = "Theme Switcher"
 
-if (-not $isAdmin) {
-    Write-Host "Нужны права администратора, запрашиваю..." -ForegroundColor Yellow
-    $argList = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $PSCommandPath, "-DarkTime", $DarkTime, "-LightTime", $LightTime)
-    try {
-        Start-Process -FilePath "powershell.exe" -ArgumentList $argList -Verb RunAs | Out-Null
-    } catch {
-        Write-Host "Не удалось получить права администратора (запрос был отклонён?)." -ForegroundColor Red
-        Read-Host "Нажмите Enter для выхода"
-        exit 1
+function ConvertTo-TimeOfDay([string]$text, [string]$paramName) {
+    $parsed = [datetime]::MinValue
+    $ok = [datetime]::TryParseExact(
+        $text.Trim(), "H:mm",
+        [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::None, [ref]$parsed)
+    if (-not $ok) {
+        throw "Неверное время в -${paramName}: '$text'. Нужен формат ЧЧ:ММ, например 20:00."
     }
-    exit
+    return $parsed.TimeOfDay
 }
 
-# Папка, где лежит сам install.ps1 - работает независимо от пользователя и диска
-$root = $PSScriptRoot
+try {
+    $root = $PSScriptRoot
+    $themeScript = Join-Path $root "theme.ps1"
+    if (-not (Test-Path $themeScript)) {
+        throw "theme.ps1 не найден рядом с install.ps1. Запускайте install.ps1 из папки проекта со всеми файлами."
+    }
 
-if (-not (Test-Path "$root\run_theme.vbs")) {
-    Write-Host "Ошибка: run_theme.vbs не найден рядом с install.ps1." -ForegroundColor Red
-    Write-Host "Убедитесь, что запускаете install.ps1 из папки проекта со всеми файлами." -ForegroundColor Red
-    exit 1
-}
+    $dark  = ConvertTo-TimeOfDay $DarkTime  "DarkTime"
+    $light = ConvertTo-TimeOfDay $LightTime "LightTime"
+    if ($dark -eq $light) {
+        throw "DarkTime и LightTime совпадают ($DarkTime) - задайте разное время."
+    }
+    $darkText  = "{0:hh\:mm}" -f $dark
+    $lightText = "{0:hh\:mm}" -f $light
 
-$actionDark  = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$root\run_theme.vbs`" dark"
-$actionLight = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$root\run_theme.vbs`" light"
+    # Убираем прежнюю установку, включая задачи старых версий.
+    & (Join-Path $root "uninstall.ps1") -Quiet
 
-$triggerDark  = New-ScheduledTaskTrigger -Daily -At $DarkTime
-$triggerLight = New-ScheduledTaskTrigger -Daily -At $LightTime
+    # conhost --headless запускает PowerShell совсем без окна (замена прежнему run_theme.vbs).
+    $conhost    = Join-Path $env:SystemRoot "System32\conhost.exe"
+    $powershell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+    $arguments  = "--headless `"$powershell`" -NoProfile -NonInteractive -ExecutionPolicy Bypass " +
+                  "-File `"$themeScript`" -Mode auto -DarkTime $darkText -LightTime $lightText"
 
-$settings = New-ScheduledTaskSettingsSet `
-    -AllowStartIfOnBatteries `
-    -DontStopIfGoingOnBatteries `
-    -RunOnlyIfNetworkAvailable:$false `
-    -StartWhenAvailable
+    $action = New-ScheduledTaskAction -Execute $conhost -Argument $arguments
 
-Register-ScheduledTask -TaskName "Theme Switcher - Dark"  -Action $actionDark  -Trigger $triggerDark  -Settings $settings -RunLevel Highest -Force | Out-Null
-Register-ScheduledTask -TaskName "Theme Switcher - Light" -Action $actionLight -Trigger $triggerLight -Settings $settings -RunLevel Highest -Force | Out-Null
+    $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $principal = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited
 
-Write-Host ""
-Write-Host "Готово! Задачи в Планировщике созданы:" -ForegroundColor Green
-Write-Host "  Theme Switcher - Dark   -> каждый день в $DarkTime"
-Write-Host "  Theme Switcher - Light  -> каждый день в $LightTime"
-Write-Host ""
-Write-Host "Проверить: Get-ScheduledTask -TaskName 'Theme Switcher*'"
-Write-Host "Удалить:   .\uninstall.ps1"
+    $settings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable `
+        -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
 
-if ($Host.Name -eq "ConsoleHost") {
+    $timeTriggers = @(
+        (New-ScheduledTaskTrigger -Daily -At ([datetime]::Today + $dark)),
+        (New-ScheduledTaskTrigger -Daily -At ([datetime]::Today + $light))
+    )
+
+    # Триггер "при входе в систему" сразу ставит нужную тему после включения компьютера.
+    # Если Windows не разрешает создать его без прав администратора - обходимся без него:
+    # пропущенный запуск всё равно выполнится благодаря StartWhenAvailable.
+    $logonTrigger = $true
+    try {
+        $triggers = $timeTriggers + (New-ScheduledTaskTrigger -AtLogOn -User $me)
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $triggers `
+            -Principal $principal -Settings $settings -Force | Out-Null
+    } catch {
+        $logonTrigger = $false
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $timeTriggers `
+            -Principal $principal -Settings $settings -Force | Out-Null
+    }
+
+    # Сразу применяем тему, подходящую для текущего времени.
+    Start-ScheduledTask -TaskName $taskName
+
     Write-Host ""
-    Read-Host "Нажмите Enter для выхода"
+    Write-Host "Готово! Задача '$taskName' создана:" -ForegroundColor Green
+    Write-Host "  тёмная тема  - с $darkText"
+    Write-Host "  светлая тема - с $lightText"
+    if ($logonTrigger) {
+        Write-Host "  плюс проверка при входе в систему"
+    }
+    Write-Host ""
+    Write-Host "Тема для текущего времени применяется прямо сейчас."
+    Write-Host "Не перемещайте и не удаляйте эту папку: задача запускает theme.ps1 отсюда."
+    Write-Host "Удалить: .\uninstall.ps1"
+} catch {
+    Write-Host ""
+    Write-Host "Ошибка установки: $($_.Exception.Message)" -ForegroundColor Red
+    exit 1
 }
